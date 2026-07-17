@@ -171,6 +171,9 @@ class Overview:
         self.screen = Wnck.Screen.get_default()
         self.screen.force_update()
         pump()
+        self.wins = usable_windows(self.screen)
+        self._built = False
+        self._tries = 0
 
         self.win = Gtk.Window()
         self.win.get_style_context().add_class('wv')
@@ -182,30 +185,41 @@ class Overview:
         self.win.connect('key-press-event', self._on_key)
         self.win.connect('destroy', Gtk.main_quit)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         for m in ('top', 'bottom', 'start', 'end'):
-            getattr(outer, 'set_margin_' + m)(20)
+            getattr(self.outer, 'set_margin_' + m)(20)
+        bg = Gtk.EventBox()
+        bg.add(self.outer)
+        bg.connect('button-press-event', lambda *_a: (self.win.destroy(), True)[1])
+        self.win.add(bg)
+        self.win.show_all()
 
-        wins = usable_windows(self.screen)
-        n = len(wins)
+        # Build the grid from the window's ACTUAL size once the WM has fullscreened
+        # it. Guessing a monitor's geometry gets the wrong size on multi-monitor /
+        # HiDPI setups, so the grid ends up filling only part of the screen.
+        GLib.timeout_add(30, self._build_once)
 
-        # Size thumbnails to fill the monitor, expose-style: pick the column count
-        # that makes the thumbnails largest while all n still fit.
-        disp = Gdk.Display.get_default()
-        mon = disp.get_primary_monitor() or disp.get_monitor(0)
-        geo = mon.get_geometry()
+    def _build_once(self):
+        self._tries += 1
+        alloc = self.win.get_allocation()
+        if (alloc.width < 400 or alloc.height < 400) and self._tries < 40:
+            return True   # not fullscreened yet -- poll again
+        self._populate(max(alloc.width, 800), max(alloc.height, 600))
+        return False
+
+    def _populate(self, w_px, h_px):
+        n = len(self.wins)
         GAP, MARGIN, HEADER_H = 16, 20, 34
-        avail_w = geo.width - 2 * MARGIN
-        avail_h = geo.height - 2 * MARGIN - HEADER_H
-        aspect = geo.width / max(1, geo.height)
-        cols, tw, th = best_grid(n, avail_w, avail_h, aspect, GAP, 40, 8) if n else (1, OV_TW, OV_TH)
+        avail_w = w_px - 2 * MARGIN
+        avail_h = h_px - 2 * MARGIN - HEADER_H
+        cols, tw, th = best_grid(n, avail_w, avail_h, w_px / max(1, h_px), GAP, 40, 8) if n else (1, OV_TW, OV_TH)
 
         hdr = Gtk.Label()
         hdr.get_style_context().add_class('hdr')
         hdr.set_markup('%d open window%s  ·  click to focus  ·  Esc to close'
                        % (n, '' if n == 1 else 's'))
         hdr.set_xalign(0.0)
-        outer.pack_start(hdr, False, False, 0)
+        self.outer.pack_start(hdr, False, False, 0)
 
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -218,17 +232,11 @@ class Overview:
         flow.set_row_spacing(GAP)
         flow.set_column_spacing(GAP)
         flow.set_homogeneous(True)
-        for w in wins:
+        for w in self.wins:
             flow.add(make_card(w, self._pick, tw, th))
         sw.add(flow)
-        outer.pack_start(sw, True, True, 0)
-
-        # click on the empty backdrop dismisses too
-        bg = Gtk.EventBox()
-        bg.add(outer)
-        bg.connect('button-press-event', lambda *_a: (self.win.destroy(), True)[1])
-        self.win.add(bg)
-        self.win.show_all()
+        self.outer.pack_start(sw, True, True, 0)
+        self.outer.show_all()
 
     def _pick(self, win, event):
         try:
