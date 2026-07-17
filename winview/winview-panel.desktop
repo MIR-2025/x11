@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=WinView Panel
+Comment=Always-on strip of open windows
+Exec=python3 /media/rwhitney/MIR/x11/winview/winview.py --panel
+Icon=preferences-system-windows
+Terminal=false
+Categories=Utility;X-XFCE;
+X-GNOME-Autostart-enabled=true

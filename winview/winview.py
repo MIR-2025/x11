@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""WinView -- a live overview of your open windows (X11 / XFCE).
+
+Two modes, one engine:
+
+  winview.py --overview   Summon a full-screen grid of window thumbnails.
+                          Click one to focus it; Esc (or click a blank area)
+                          dismisses. Great bound to a hotkey. (default)
+
+  winview.py --panel      A always-on-top strip that stays open and refreshes
+                          live. Click a thumbnail to focus that window.
+                          --edge top|bottom chooses where it sits.
+
+Needs: python3-gi, GTK 3, libwnck (gir1.2-wnck-3.0). All standard on XFCE.
+"""
+
+import argparse
+import math
+import gi
+
+gi.require_version('Gtk', '3.0')
+gi.require_version('Wnck', '3.0')
+gi.require_version('GdkX11', '3.0')
+from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Wnck, GdkX11, Pango  # noqa: E402
+
+# ---- sizes ----
+OV_TW, OV_TH = 300, 176        # overview thumbnail box
+PANEL_H = 128                   # panel strip height
+PANEL_TW, PANEL_TH = 176, 96    # panel thumbnail box
+
+CSS = b"""
+window.wv, window.panel { background: rgba(18, 21, 26, 0.97); }
+.hdr { color: #9aa4b2; font-size: 12px; }
+.card { background: #23272f; border: 1px solid #333a45; border-radius: 11px; }
+.card:hover { background: #2c313b; border-color: #4c8bf5; }
+.thumb { background: #0f1216; border-radius: 8px; }
+.title { color: #e7ebf1; font-size: 12px; }
+.subtitle { color: #9aa4b2; font-size: 10px; }
+"""
+
+
+def apply_css():
+    prov = Gtk.CssProvider()
+    prov.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+def pump():
+    """Let Wnck/GTK process pending events (so the window list is populated)."""
+    for _ in range(80):
+        if Gtk.events_pending():
+            Gtk.main_iteration()
+
+
+def best_grid(n, avail_w, avail_h, aspect, gap, chrome_h, pad):
+    """Pick the column count that makes the thumbnails as large as possible while
+    fitting all n windows in avail_w x avail_h. Returns (cols, thumb_w, thumb_h)."""
+    best = None
+    for cols in range(1, max(1, n) + 1):
+        rows = math.ceil(n / cols)
+        cell_w = (avail_w - (cols - 1) * gap) / cols
+        cell_h = (avail_h - (rows - 1) * gap) / rows
+        tmax_w = cell_w - 2 * pad
+        tmax_h = cell_h - chrome_h
+        if tmax_w < 40 or tmax_h < 30:
+            continue
+        tw = min(tmax_w, tmax_h * aspect)
+        th = tw / aspect
+        area = tw * th
+        if best is None or area > best[0]:
+            best = (area, cols, int(tw), int(th))
+    if best is None:
+        return (min(n, 4) or 1, 220, 130)
+    return best[1], best[2], best[3]
+
+
+def usable_windows(screen):
+    out = []
+    for w in screen.get_windows():
+        if w.is_skip_tasklist():
+            continue
+        t = w.get_window_type()
+        if t in (Wnck.WindowType.DESKTOP, Wnck.WindowType.DOCK, Wnck.WindowType.SPLASHSCREEN):
+            continue
+        out.append(w)
+    return out
+
+
+def capture_thumb(xid, max_w, max_h):
+    """Grab the current contents of a window as a scaled pixbuf, or None."""
+    disp = Gdk.Display.get_default()
+    try:
+        gw = GdkX11.X11Window.foreign_new_for_display(disp, xid)
+    except Exception:
+        return None
+    if gw is None:
+        return None
+    w, h = gw.get_width(), gw.get_height()
+    if w <= 0 or h <= 0:
+        return None
+    try:
+        pb = Gdk.pixbuf_get_from_window(gw, 0, 0, w, h)
+    except Exception:
+        return None
+    if pb is None:
+        return None
+    scale = min(max_w / w, max_h / h)
+    return pb.scale_simple(max(1, int(w * scale)), max(1, int(h * scale)), GdkPixbuf.InterpType.BILINEAR)
+
+
+def scaled_icon(win, size):
+    icon = win.get_icon()
+    if icon is None:
+        return None
+    if icon.get_width() != size:
+        icon = icon.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+    return icon
+
+
+def thumb_holder(win, tw, th):
+    """A fixed-size box showing the window thumbnail, or its icon as a fallback."""
+    holder = Gtk.Box()
+    holder.get_style_context().add_class('thumb')
+    holder.set_size_request(tw, th)
+    img = Gtk.Image()
+    pb = None if win.is_minimized() else capture_thumb(win.get_xid(), tw - 4, th - 4)
+    if pb is not None:
+        img.set_from_pixbuf(pb)
+    else:
+        big = scaled_icon(win, 48)
+        if big is not None:
+            img.set_from_pixbuf(big)
+    img.set_halign(Gtk.Align.CENTER)
+    img.set_valign(Gtk.Align.CENTER)
+    holder.set_center_widget(img)
+    return holder
+
+
+def make_card(win, on_click, tw, th, title_chars=26):
+    card = Gtk.EventBox()
+    card.get_style_context().add_class('card')
+    card.set_above_child(False)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    for m in ('top', 'bottom', 'start', 'end'):
+        getattr(box, 'set_margin_' + m)(8)
+    box.pack_start(thumb_holder(win, tw, th), False, False, 0)
+
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    mini = scaled_icon(win, 16)
+    if mini is not None:
+        row.pack_start(Gtk.Image.new_from_pixbuf(mini), False, False, 0)
+    lbl = Gtk.Label(label=win.get_name() or '(untitled)')
+    lbl.get_style_context().add_class('title')
+    lbl.set_ellipsize(Pango.EllipsizeMode.END)
+    lbl.set_max_width_chars(title_chars)
+    lbl.set_xalign(0.0)
+    row.pack_start(lbl, True, True, 0)
+    box.pack_start(row, False, False, 0)
+
+    card.add(box)
+    card.connect('button-press-event', lambda _w, e: on_click(win, e))
+    return card
+
+
+class Overview:
+    """Full-screen grid; click focuses a window and dismisses."""
+
+    def __init__(self):
+        self.screen = Wnck.Screen.get_default()
+        self.screen.force_update()
+        pump()
+
+        self.win = Gtk.Window()
+        self.win.get_style_context().add_class('wv')
+        self.win.set_decorated(False)
+        self.win.set_skip_taskbar_hint(True)
+        self.win.set_skip_pager_hint(True)
+        self.win.set_keep_above(True)
+        self.win.fullscreen()
+        self.win.connect('key-press-event', self._on_key)
+        self.win.connect('destroy', Gtk.main_quit)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        for m in ('top', 'bottom', 'start', 'end'):
+            getattr(outer, 'set_margin_' + m)(20)
+
+        wins = usable_windows(self.screen)
+        n = len(wins)
+
+        # Size thumbnails to fill the monitor, expose-style: pick the column count
+        # that makes the thumbnails largest while all n still fit.
+        disp = Gdk.Display.get_default()
+        mon = disp.get_primary_monitor() or disp.get_monitor(0)
+        geo = mon.get_geometry()
+        GAP, MARGIN, HEADER_H = 16, 20, 34
+        avail_w = geo.width - 2 * MARGIN
+        avail_h = geo.height - 2 * MARGIN - HEADER_H
+        aspect = geo.width / max(1, geo.height)
+        cols, tw, th = best_grid(n, avail_w, avail_h, aspect, GAP, 40, 8) if n else (1, OV_TW, OV_TH)
+
+        hdr = Gtk.Label()
+        hdr.get_style_context().add_class('hdr')
+        hdr.set_markup('%d open window%s  ·  click to focus  ·  Esc to close'
+                       % (n, '' if n == 1 else 's'))
+        hdr.set_xalign(0.0)
+        outer.pack_start(hdr, False, False, 0)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        flow = Gtk.FlowBox()
+        flow.set_valign(Gtk.Align.START)
+        flow.set_halign(Gtk.Align.CENTER)
+        flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        flow.set_min_children_per_line(cols)
+        flow.set_max_children_per_line(cols)
+        flow.set_row_spacing(GAP)
+        flow.set_column_spacing(GAP)
+        flow.set_homogeneous(True)
+        for w in wins:
+            flow.add(make_card(w, self._pick, tw, th))
+        sw.add(flow)
+        outer.pack_start(sw, True, True, 0)
+
+        # click on the empty backdrop dismisses too
+        bg = Gtk.EventBox()
+        bg.add(outer)
+        bg.connect('button-press-event', lambda *_a: (self.win.destroy(), True)[1])
+        self.win.add(bg)
+        self.win.show_all()
+
+    def _pick(self, win, event):
+        try:
+            win.activate(event.time)
+        except Exception:
+            pass
+        self.win.destroy()
+        return True   # stop propagation to the backdrop
+
+    def _on_key(self, _w, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.win.destroy()
+
+
+class Panel:
+    """Always-on-top strip that stays open and refreshes live."""
+
+    REFRESH_MS = 4000
+
+    def __init__(self, edge='top'):
+        self.screen = Wnck.Screen.get_default()
+        self.screen.force_update()
+        pump()
+
+        self.win = Gtk.Window()
+        self.win.get_style_context().add_class('panel')
+        self.win.set_decorated(False)
+        self.win.set_skip_taskbar_hint(True)
+        self.win.set_skip_pager_hint(True)
+        self.win.set_keep_above(True)
+        self.win.set_accept_focus(False)
+        self.win.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.win.connect('destroy', Gtk.main_quit)
+
+        gscreen = Gdk.Screen.get_default()
+        width = gscreen.get_width()
+        self.win.set_size_request(width, PANEL_H)
+        self.win.move(0, 0 if edge == 'top' else gscreen.get_height() - PANEL_H)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        self.strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for m in ('top', 'bottom', 'start', 'end'):
+            getattr(self.strip, 'set_margin_' + m)(8)
+        sw.add(self.strip)
+        self.win.add(sw)
+
+        self._pending = False
+        for sig in ('window-opened', 'window-closed', 'active-window-changed'):
+            self.screen.connect(sig, self._schedule)
+        GLib.timeout_add(self.REFRESH_MS, self._tick)
+
+        self.rebuild()
+        self.win.show_all()
+
+    def rebuild(self):
+        for c in self.strip.get_children():
+            self.strip.remove(c)
+        for w in usable_windows(self.screen):
+            self.strip.pack_start(make_card(w, self._focus, PANEL_TW, PANEL_TH, title_chars=16), False, False, 0)
+        self.strip.show_all()
+
+    def _focus(self, win, event):
+        try:
+            win.activate(event.time)
+        except Exception:
+            pass
+        return True
+
+    def _schedule(self, *_a):
+        if self._pending:
+            return
+        self._pending = True
+        GLib.timeout_add(250, self._do_scheduled)
+
+    def _do_scheduled(self):
+        self._pending = False
+        self.rebuild()
+        return False
+
+    def _tick(self):
+        self.rebuild()
+        return True
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Live overview of your open windows.')
+    grp = ap.add_mutually_exclusive_group()
+    grp.add_argument('--overview', action='store_true', help='summon a grid (default)')
+    grp.add_argument('--panel', action='store_true', help='a docked, always-on strip')
+    ap.add_argument('--edge', choices=['top', 'bottom'], default='top', help='panel position')
+    args = ap.parse_args()
+
+    apply_css()
+    if args.panel:
+        Panel(edge=args.edge)
+    else:
+        Overview()
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()

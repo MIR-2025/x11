@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=WinView Overview
+Comment=Grid of open windows -- click to focus
+Exec=python3 /media/rwhitney/MIR/x11/winview/winview.py --overview
+Icon=preferences-system-windows
+Terminal=false
+Categories=Utility;X-XFCE;
