@@ -22,6 +22,13 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('Wnck', '3.0')
 gi.require_version('GdkX11', '3.0')
 from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Wnck, GdkX11, Pango  # noqa: E402
+import cairo  # noqa: E402
+
+try:
+    from Xlib import display as _xlib_display, X as _xlib_X
+    _HAVE_XLIB = True
+except Exception:
+    _HAVE_XLIB = False
 
 # ---- sizes ----
 OV_TW, OV_TH = 300, 176        # overview thumbnail box
@@ -89,26 +96,65 @@ def usable_windows(screen):
     return out
 
 
-def capture_thumb(xid, max_w, max_h):
-    """Grab the current contents of a window as a scaled pixbuf, or None."""
-    disp = Gdk.Display.get_default()
+_XDISPLAY = None
+
+
+def _xdisplay():
+    global _XDISPLAY
+    if _XDISPLAY is None and _HAVE_XLIB:
+        try:
+            _XDISPLAY = _xlib_display.Display()
+        except Exception:
+            _XDISPLAY = False
+    return _XDISPLAY or None
+
+
+def capture_surface(xid, max_w, max_h):
+    """Grab a window's contents as a scaled cairo surface, or None.
+
+    Uses XGetImage (python-xlib), NOT gdk_pixbuf_get_from_window: the latter can abort
+    the whole process in cairo (`cairo_surface_mark_dirty` on a surface that carries
+    mime data) when it captures a window that's mid-render -- a race that's impossible
+    to guard against from Python. XGetImage bypasses cairo/gdk, and still sees
+    obscured windows because the compositor keeps their pixmaps."""
+    d = _xdisplay()
+    if d is None:
+        return None
     try:
-        gw = GdkX11.X11Window.foreign_new_for_display(disp, xid)
+        xw = d.create_resource_object('window', xid)
+        g = xw.get_geometry()
+        w, h = g.width, g.height
+        if w <= 0 or h <= 0 or g.depth not in (24, 32):
+            return None
+        img = xw.get_image(0, 0, w, h, _xlib_X.ZPixmap, 0xffffffff)
+        data = img.data
+        if not isinstance(data, (bytes, bytearray)):
+            data = bytes(data)
     except Exception:
         return None
-    if gw is None:
-        return None
-    w, h = gw.get_width(), gw.get_height()
-    if w <= 0 or h <= 0:
-        return None
     try:
-        pb = Gdk.pixbuf_get_from_window(gw, 0, 0, w, h)
+        big = cairo.ImageSurface(cairo.FORMAT_RGB24, w, h)
+        dst = big.get_data()
+        ds = big.get_stride()
+        ss = len(data) // h
+        if ss == ds and len(dst) == len(data):
+            dst[:] = data
+        else:
+            row = min(ss, ds)
+            for y in range(h):
+                dst[y * ds:y * ds + row] = data[y * ss:y * ss + row]
+        big.mark_dirty()
+        scale = min(max_w / w, max_h / h)
+        tw, th = max(1, int(w * scale)), max(1, int(h * scale))
+        small = cairo.ImageSurface(cairo.FORMAT_RGB24, tw, th)
+        cr = cairo.Context(small)
+        cr.scale(scale, scale)
+        cr.set_source_surface(big, 0, 0)
+        cr.get_source().set_filter(cairo.FILTER_GOOD)
+        cr.paint()
+        return small
     except Exception:
         return None
-    if pb is None:
-        return None
-    scale = min(max_w / w, max_h / h)
-    return pb.scale_simple(max(1, int(w * scale)), max(1, int(h * scale)), GdkPixbuf.InterpType.BILINEAR)
 
 
 def scaled_icon(win, size):
@@ -120,23 +166,71 @@ def scaled_icon(win, size):
     return icon
 
 
+def clean_pixbuf(pb):
+    """Rebuild a pixbuf from just its raw pixels, dropping any options. Some pixbufs
+    (notably app icons) carry the original file bytes as an option; GDK then attaches
+    that as cairo "mime data", and drawing it aborts in cairo_surface_mark_dirty
+    (`Assertion !_cairo_surface_has_mime_data`). A pixel-only copy has no mime data."""
+    if pb is None:
+        return None
+    try:
+        return GdkPixbuf.Pixbuf.new_from_bytes(
+            pb.read_pixel_bytes(), pb.get_colorspace(), pb.get_has_alpha(),
+            pb.get_bits_per_sample(), pb.get_width(), pb.get_height(), pb.get_rowstride())
+    except Exception:
+        return pb
+
+
+def pixbuf_area(pb, w, h, css_class=None):
+    """A DrawingArea that paints a pixbuf centered, via cairo (Gtk.Image and
+    gdk_cairo_set_source_pixbuf both mark the surface dirty, which aborts on pixbufs
+    that carry mime data -- so we draw a cleaned, pixel-only copy)."""
+    pb = clean_pixbuf(pb)
+    da = Gtk.DrawingArea()
+    da.set_size_request(w, h)
+    if css_class:
+        da.get_style_context().add_class(css_class)
+
+    def on_draw(widget, cr):
+        if pb is None:
+            return False
+        a = widget.get_allocation()
+        iw, ih = pb.get_width(), pb.get_height()
+        Gdk.cairo_set_source_pixbuf(cr, pb, (a.width - iw) / 2, (a.height - ih) / 2)
+        cr.paint()
+        return False
+
+    da.connect('draw', on_draw)
+    return da
+
+
+def surface_area(surface, w, h, css_class=None):
+    """A DrawingArea that paints a cairo surface centered (for window thumbnails,
+    which we capture as surfaces rather than pixbufs)."""
+    da = Gtk.DrawingArea()
+    da.set_size_request(w, h)
+    if css_class:
+        da.get_style_context().add_class(css_class)
+
+    def on_draw(widget, cr):
+        if surface is None:
+            return False
+        a = widget.get_allocation()
+        sw, sh = surface.get_width(), surface.get_height()
+        cr.set_source_surface(surface, (a.width - sw) / 2, (a.height - sh) / 2)
+        cr.paint()
+        return False
+
+    da.connect('draw', on_draw)
+    return da
+
+
 def thumb_holder(win, tw, th):
-    """A fixed-size box showing the window thumbnail, or its icon as a fallback."""
-    holder = Gtk.Box()
-    holder.get_style_context().add_class('thumb')
-    holder.set_size_request(tw, th)
-    img = Gtk.Image()
-    pb = None if win.is_minimized() else capture_thumb(win.get_xid(), tw - 4, th - 4)
-    if pb is not None:
-        img.set_from_pixbuf(pb)
-    else:
-        big = scaled_icon(win, 48)
-        if big is not None:
-            img.set_from_pixbuf(big)
-    img.set_halign(Gtk.Align.CENTER)
-    img.set_valign(Gtk.Align.CENTER)
-    holder.set_center_widget(img)
-    return holder
+    """A fixed-size thumbnail of the window, or its icon as a fallback."""
+    surf = None if win.is_minimized() else capture_surface(win.get_xid(), tw - 4, th - 4)
+    if surf is not None:
+        return surface_area(surf, tw, th, 'thumb')
+    return pixbuf_area(scaled_icon(win, 48), tw, th, 'thumb')
 
 
 def make_card(win, on_click, tw, th, title_chars=26):
@@ -152,7 +246,7 @@ def make_card(win, on_click, tw, th, title_chars=26):
     row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
     mini = scaled_icon(win, 16)
     if mini is not None:
-        row.pack_start(Gtk.Image.new_from_pixbuf(mini), False, False, 0)
+        row.pack_start(pixbuf_area(mini, 16, 16), False, False, 0)
     lbl = Gtk.Label(label=win.get_name() or '(untitled)')
     lbl.get_style_context().add_class('title')
     lbl.set_ellipsize(Pango.EllipsizeMode.END)

@@ -24,7 +24,7 @@ Standard on XFCE, and already present on this machine:
 - **A running compositor** (XFCE's is on by default; needed for thumbnails of
   windows that aren't on top). Check: *Settings -> Window Manager Tweaks ->
   Compositor -> Enable display compositing*.
-- `python3-gi`, GTK 3, and `gir1.2-wnck-3.0`
+- `python3-gi`, GTK 3, `gir1.2-wnck-3.0`, and `python3-xlib`
 
 ## Run
 
