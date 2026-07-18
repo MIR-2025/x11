@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=WinView
+Comment=Live overview of your open windows -- click or Enter to focus
+Exec=python3 /media/rwhitney/MIR/x11/winview/winview.py
+Icon=preferences-system-windows
+Terminal=false
+Categories=Utility;X-XFCE;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

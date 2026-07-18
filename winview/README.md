@@ -1,13 +1,16 @@
 # WinView -- a live overview of your open windows
 
 A small GTK app for X11 / XFCE that shows your open windows as **live
-thumbnails**, so you can see and jump to any of them at a glance. Two modes from
+thumbnails**, so you can see and jump to any of them at a glance. Three modes from
 one script:
 
-- **Overview** -- summon a full-screen grid, click a window to focus it, `Esc` to
-  dismiss. Bind it to a hotkey for an expose-style switcher. *(default)*
-- **Panel** -- an always-on-top strip that stays open and refreshes live; click a
-  thumbnail to focus that window.
+- **Window** *(default)* -- a persistent, normal window that shows in the taskbar and
+  Alt+Tab, and stays open. Keyboard-navigable: **arrows** move, **Enter** focuses the
+  selected window, **Ctrl+W** closes it, and **just start typing** to filter. Meant to
+  stay open and **start on login** (see below).
+- **Overview** (`--overview`) -- summon a full-screen expose grid, click a window to
+  focus it, `Esc` to dismiss. Good bound to a hotkey.
+- **Panel** (`--panel`) -- an always-on-top strip that refreshes live.
 
 It uses `libwnck` to enumerate windows (with live open/close/focus events) and
 captures each window's contents with `Gdk.pixbuf_get_from_window` -- which works
@@ -26,11 +29,22 @@ Standard on XFCE, and already present on this machine:
 ## Run
 
 ```sh
-python3 winview.py               # overview (default)
-python3 winview.py --overview
+python3 winview.py               # persistent window (default)
+python3 winview.py --overview            # full-screen expose grid (summon + dismiss)
 python3 winview.py --panel               # docked strip, top of screen
 python3 winview.py --panel --edge bottom
 ```
+
+### Start on login
+
+Copy the launcher into your autostart folder:
+
+```sh
+cp winview.desktop ~/.config/autostart/
+```
+
+(That's already done on this machine.) It launches the persistent window on login.
+Remove `~/.config/autostart/winview.desktop` to stop it.
 
 ### Bind the overview to a hotkey (recommended)
 

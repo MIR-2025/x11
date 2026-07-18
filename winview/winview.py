@@ -30,6 +30,8 @@ PANEL_TW, PANEL_TH = 176, 96    # panel thumbnail box
 
 CSS = b"""
 window.wv, window.panel { background: rgba(18, 21, 26, 0.97); }
+window.dash { background: #14171c; }
+.dash-bar { background: #1f232b; border-bottom: 1px solid #333a45; }
 .hdr { color: #9aa4b2; font-size: 12px; }
 .card { background: #23272f; border: 1px solid #333a45; border-radius: 11px; }
 .card:hover { background: #2c313b; border-color: #4c8bf5; }
@@ -322,19 +324,163 @@ class Panel:
         return True
 
 
+class Dashboard:
+    """A persistent, normal window -- shows in the taskbar and Alt+Tab ("tabbable"),
+    keyboard-navigable (arrows to move, Enter to focus a window, Ctrl+W to close one,
+    or just type to filter). Meant to stay open and start on login. This is the
+    default mode."""
+
+    REFRESH_MS = 5000
+    TW, TH = 250, 148
+
+    def __init__(self):
+        self.screen = Wnck.Screen.get_default()
+        self.screen.force_update()
+        pump()
+        self.query = ''
+
+        self.win = Gtk.Window()
+        self.win.get_style_context().add_class('dash')
+        self.win.set_title('WinView')
+        self.win.set_default_size(1120, 720)
+        try: self.win.set_icon_name('preferences-system-windows')
+        except Exception: pass
+        self.win.connect('destroy', Gtk.main_quit)
+        self.win.connect('key-press-event', self._on_key)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        bar.get_style_context().add_class('dash-bar')
+        for m in ('top', 'bottom', 'start', 'end'):
+            getattr(bar, 'set_margin_' + m)(10)
+        self.search = Gtk.SearchEntry()
+        self.search.set_placeholder_text('Filter windows by title or app...')
+        self.search.connect('search-changed', self._on_search)
+        bar.pack_start(self.search, True, True, 0)
+        self.count = Gtk.Label()
+        self.count.get_style_context().add_class('hdr')
+        bar.pack_end(self.count, False, False, 8)
+        box.pack_start(bar, False, False, 0)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.flow = Gtk.FlowBox()
+        self.flow.set_valign(Gtk.Align.START)
+        self.flow.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.flow.set_max_children_per_line(8)
+        self.flow.set_row_spacing(14)
+        self.flow.set_column_spacing(14)
+        self.flow.set_homogeneous(True)
+        for m in ('top', 'bottom', 'start', 'end'):
+            getattr(self.flow, 'set_margin_' + m)(14)
+        self.flow.set_filter_func(self._filter)
+        self.flow.connect('child-activated', self._on_activated)
+        sw.add(self.flow)
+        box.pack_start(sw, True, True, 0)
+        self.win.add(box)
+
+        self._pending = False
+        for sig in ('window-opened', 'window-closed', 'active-window-changed'):
+            self.screen.connect(sig, self._schedule)
+        GLib.timeout_add(self.REFRESH_MS, self._tick)
+
+        self.rebuild()
+        self.win.show_all()
+        self.flow.get_style_context()  # ensure realized
+        GLib.idle_add(lambda: (self.flow.grab_focus(), False)[1])
+
+    def rebuild(self):
+        for c in self.flow.get_children():
+            self.flow.remove(c)
+        wins = usable_windows(self.screen)
+        for w in wins:
+            child = Gtk.FlowBoxChild()
+            child.win = w
+            app = w.get_application().get_name() if w.get_application() else ''
+            child.search = ((w.get_name() or '') + ' ' + app).lower()
+            child.add(make_card(w, self._click, self.TW, self.TH))
+            self.flow.add(child)
+        self.count.set_text(str(len(wins)) + (' window' if len(wins) == 1 else ' windows'))
+        self.flow.show_all()
+        self.flow.invalidate_filter()
+
+    def _click(self, win, event):
+        self._focus(win, event.time)
+        return False  # let FlowBox still select the child
+
+    def _on_activated(self, _flow, child):
+        if getattr(child, 'win', None):
+            self._focus(child.win, Gtk.get_current_event_time())
+
+    def _focus(self, win, ts):
+        try:
+            win.activate(ts or Gtk.get_current_event_time())
+        except Exception:
+            pass
+
+    def _on_search(self, entry):
+        self.query = entry.get_text().strip().lower()
+        self.flow.invalidate_filter()
+
+    def _filter(self, child):
+        return (not self.query) or (self.query in getattr(child, 'search', ''))
+
+    def _on_key(self, _w, event):
+        ctrl = event.state & Gdk.ModifierType.CONTROL_MASK
+        alt = event.state & Gdk.ModifierType.MOD1_MASK
+        if ctrl and event.keyval in (Gdk.KEY_w, Gdk.KEY_W):
+            sel = self.flow.get_selected_children()
+            if sel and getattr(sel[0], 'win', None):
+                try: sel[0].win.close(Gtk.get_current_event_time())
+                except Exception: pass
+            return True
+        if event.keyval == Gdk.KEY_Escape and self.search.get_text():
+            self.search.set_text('')
+            return True
+        # type-to-filter: a printable key (not space) jumps into the search box
+        if not ctrl and not alt and not self.search.has_focus():
+            uni = Gdk.keyval_to_unicode(event.keyval)
+            if uni:
+                ch = chr(uni)
+                if ch.isprintable() and ch != ' ':
+                    self.search.grab_focus()
+                    self.search.set_text(self.search.get_text() + ch)
+                    self.search.set_position(-1)
+                    return True
+        return False
+
+    def _schedule(self, *_a):
+        if self._pending:
+            return
+        self._pending = True
+        GLib.timeout_add(250, self._do_scheduled)
+
+    def _do_scheduled(self):
+        self._pending = False
+        self.rebuild()
+        return False
+
+    def _tick(self):
+        self.rebuild()
+        return True
+
+
 def main():
-    ap = argparse.ArgumentParser(description='Live overview of your open windows.')
+    ap = argparse.ArgumentParser(description='A live overview of your open windows.')
     grp = ap.add_mutually_exclusive_group()
-    grp.add_argument('--overview', action='store_true', help='summon a grid (default)')
+    grp.add_argument('--window', action='store_true', help='persistent, tabbable window (default)')
+    grp.add_argument('--overview', action='store_true', help='summon a full-screen grid')
     grp.add_argument('--panel', action='store_true', help='a docked, always-on strip')
     ap.add_argument('--edge', choices=['top', 'bottom'], default='top', help='panel position')
     args = ap.parse_args()
 
     apply_css()
-    if args.panel:
+    if args.overview:
+        Overview()
+    elif args.panel:
         Panel(edge=args.edge)
     else:
-        Overview()
+        Dashboard()
     Gtk.main()
 
 
