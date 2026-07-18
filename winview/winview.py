@@ -425,18 +425,23 @@ class Dashboard:
     default mode."""
 
     REFRESH_MS = 5000
-    TW, TH = 250, 148
+    TARGET_TW = 340          # desired thumbnail width; cards grow/shrink around this
+    MAX_COLS = 8
+    ASPECT = 250 / 148       # thumbnail width : height
 
     def __init__(self):
         self.screen = Wnck.Screen.get_default()
         self.screen.force_update()
         pump()
         self.query = ''
+        self.TW, self.TH = 250, 148   # current card size (recomputed to fill the width)
+        self._last_w = 0
+        self._resize_id = 0
 
         self.win = Gtk.Window()
         self.win.get_style_context().add_class('dash')
         self.win.set_title('WinView')
-        self.win.set_default_size(1120, 720)
+        self.win.set_default_size(*self._default_size())
         try: self.win.set_icon_name('preferences-system-windows')
         except Exception: pass
         self.win.connect('destroy', Gtk.main_quit)
@@ -456,12 +461,14 @@ class Dashboard:
         bar.pack_end(self.count, False, False, 8)
         box.pack_start(bar, False, False, 0)
 
-        sw = Gtk.ScrolledWindow()
-        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.sw = Gtk.ScrolledWindow()
+        self.sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.sw.connect('size-allocate', self._on_resize)
         self.flow = Gtk.FlowBox()
         self.flow.set_valign(Gtk.Align.START)
         self.flow.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.flow.set_max_children_per_line(8)
+        self.flow.set_min_children_per_line(1)
+        self.flow.set_max_children_per_line(self.MAX_COLS)
         self.flow.set_row_spacing(14)
         self.flow.set_column_spacing(14)
         self.flow.set_homogeneous(True)
@@ -469,8 +476,8 @@ class Dashboard:
             getattr(self.flow, 'set_margin_' + m)(14)
         self.flow.set_filter_func(self._filter)
         self.flow.connect('child-activated', self._on_activated)
-        sw.add(self.flow)
-        box.pack_start(sw, True, True, 0)
+        self.sw.add(self.flow)
+        box.pack_start(self.sw, True, True, 0)
         self.win.add(box)
 
         self._pending = False
@@ -483,10 +490,68 @@ class Dashboard:
         self.flow.get_style_context()  # ensure realized
         GLib.idle_add(lambda: (self.flow.grab_focus(), False)[1])
 
+    def _default_size(self):
+        """Open proportional to the monitor so there's room for big cards (esp. 4K)."""
+        try:
+            disp = Gdk.Display.get_default()
+            mon = disp.get_primary_monitor() or disp.get_monitor(0)
+            geo = mon.get_workarea()
+            return max(900, int(geo.width * 0.72)), max(600, int(geo.height * 0.8))
+        except Exception:
+            return 1280, 800
+
+    def _avail_w(self):
+        w = self.sw.get_allocated_width()
+        if w <= 1:
+            w = self.win.get_allocated_width()
+        if w <= 1:
+            w = self.win.get_size()[0]
+        return max(320, w)
+
+    def _avail_h(self):
+        h = self.sw.get_allocated_height()
+        if h <= 1:
+            h = self.win.get_size()[1]
+        return max(240, h)
+
+    def _layout(self, avail_w, n):
+        """Choose columns + thumbnail size so the cards fill the available width.
+        Few windows -> fewer, bigger cards; a wide/4K viewport -> bigger cards, not
+        a strip of small ones with empty space to the right."""
+        GAP, MARGIN, OVER = 14, 14, 18   # flow spacing, flow margins, per-card chrome
+        inner = max(1, avail_w - 2 * MARGIN)
+        cols = round((inner + GAP) / (self.TARGET_TW + OVER + GAP))
+        cols = max(1, min(self.MAX_COLS, cols, max(1, n)))
+        tw = max(160, int((inner - (cols - 1) * GAP) / cols) - OVER)
+        th = int(tw / self.ASPECT)
+        # Don't let a card grow taller than the viewport -- otherwise a single window
+        # becomes one giant card you have to scroll to see.
+        max_th = int(self._avail_h() * 0.62)
+        if max_th > 60 and th > max_th:
+            th, tw = max_th, int(max_th * self.ASPECT)
+        return cols, tw, th
+
+    def _on_resize(self, _w, alloc):
+        # Re-fit the cards to the new width (debounced -- one rebuild after the drag).
+        if abs(alloc.width - self._last_w) < 8:
+            return
+        self._last_w = alloc.width
+        if self._resize_id:
+            GLib.source_remove(self._resize_id)
+        self._resize_id = GLib.timeout_add(120, self._resize_done)
+
+    def _resize_done(self):
+        self._resize_id = 0
+        self.rebuild()
+        return False
+
     def rebuild(self):
         for c in self.flow.get_children():
             self.flow.remove(c)
         wins = usable_windows(self.screen)
+        n = len(wins)
+        cols, self.TW, self.TH = self._layout(self._avail_w(), n)
+        self.flow.set_max_children_per_line(cols)
         for w in wins:
             child = Gtk.FlowBoxChild()
             child.win = w
@@ -494,7 +559,7 @@ class Dashboard:
             child.search = ((w.get_name() or '') + ' ' + app).lower()
             child.add(make_card(w, self._click, self.TW, self.TH))
             self.flow.add(child)
-        self.count.set_text(str(len(wins)) + (' window' if len(wins) == 1 else ' windows'))
+        self.count.set_text(str(n) + (' window' if n == 1 else ' windows'))
         self.flow.show_all()
         self.flow.invalidate_filter()
 
