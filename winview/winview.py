@@ -425,7 +425,8 @@ class Dashboard:
     default mode."""
 
     REFRESH_MS = 5000
-    TARGET_TW = 340          # desired thumbnail width; cards grow/shrink around this
+    TARGET_TW = 340          # desired thumbnail width in the scroll (overflow) fallback
+    MIN_TW = 230             # below this, stop shrinking and start scrolling instead
     MAX_COLS = 8
     ASPECT = 250 / 148       # thumbnail width : height
 
@@ -434,8 +435,9 @@ class Dashboard:
         self.screen.force_update()
         pump()
         self.query = ''
-        self.TW, self.TH = 250, 148   # current card size (recomputed to fill the width)
+        self.TW, self.TH = 250, 148   # current card size (recomputed to fill the viewport)
         self._last_w = 0
+        self._last_h = 0
         self._resize_id = 0
 
         self.win = Gtk.Window()
@@ -465,8 +467,9 @@ class Dashboard:
         self.sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.sw.connect('size-allocate', self._on_resize)
         self.flow = Gtk.FlowBox()
-        self.flow.set_valign(Gtk.Align.START)
+        self.flow.set_valign(Gtk.Align.CENTER)  # centers the grid when it fills the height
         self.flow.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.flow.set_activate_on_single_click(True)  # single click focuses the window
         self.flow.set_min_children_per_line(1)
         self.flow.set_max_children_per_line(self.MAX_COLS)
         self.flow.set_row_spacing(14)
@@ -514,28 +517,30 @@ class Dashboard:
             h = self.win.get_size()[1]
         return max(240, h)
 
-    def _layout(self, avail_w, n):
-        """Choose columns + thumbnail size so the cards fill the available width.
-        Few windows -> fewer, bigger cards; a wide/4K viewport -> bigger cards, not
-        a strip of small ones with empty space to the right."""
-        GAP, MARGIN, OVER = 14, 14, 18   # flow spacing, flow margins, per-card chrome
-        inner = max(1, avail_w - 2 * MARGIN)
-        cols = round((inner + GAP) / (self.TARGET_TW + OVER + GAP))
-        cols = max(1, min(self.MAX_COLS, cols, max(1, n)))
-        tw = max(160, int((inner - (cols - 1) * GAP) / cols) - OVER)
+    def _layout(self, avail_w, avail_h, n):
+        """Size the grid to fill the viewport in BOTH dimensions (like the fullscreen
+        overview): pick the column count that makes the thumbnails as large as possible
+        while still fitting all n windows in the visible area, so the grid fills the
+        height, not just the width. If there are too many windows to show at a
+        comfortable size, fall back to filling the width and scrolling vertically."""
+        GAP, PAD, CHROME, MARGIN = 14, 9, 44, 14  # spacing, card h-pad, card v-chrome, flow margin
+        aw = max(1, avail_w - 2 * MARGIN)
+        ah = max(1, avail_h - 2 * MARGIN)
+        cols, tw, th = best_grid(n, aw, ah, self.ASPECT, GAP, CHROME, PAD)
+        if tw >= self.MIN_TW:
+            return cols, tw, th
+        # Too many to fit at a comfortable size -> fill width, let it scroll.
+        cols = max(1, min(self.MAX_COLS, n,
+                          round((aw + GAP) / (self.TARGET_TW + 2 * PAD + GAP))))
+        tw = max(self.MIN_TW, int((aw - (cols - 1) * GAP) / cols) - 2 * PAD)
         th = int(tw / self.ASPECT)
-        # Don't let a card grow taller than the viewport -- otherwise a single window
-        # becomes one giant card you have to scroll to see.
-        max_th = int(self._avail_h() * 0.62)
-        if max_th > 60 and th > max_th:
-            th, tw = max_th, int(max_th * self.ASPECT)
         return cols, tw, th
 
     def _on_resize(self, _w, alloc):
-        # Re-fit the cards to the new width (debounced -- one rebuild after the drag).
-        if abs(alloc.width - self._last_w) < 8:
+        # Re-fit the cards to the new size (debounced -- one rebuild after the drag).
+        if abs(alloc.width - self._last_w) < 8 and abs(alloc.height - self._last_h) < 8:
             return
-        self._last_w = alloc.width
+        self._last_w, self._last_h = alloc.width, alloc.height
         if self._resize_id:
             GLib.source_remove(self._resize_id)
         self._resize_id = GLib.timeout_add(120, self._resize_done)
@@ -550,7 +555,7 @@ class Dashboard:
             self.flow.remove(c)
         wins = usable_windows(self.screen)
         n = len(wins)
-        cols, self.TW, self.TH = self._layout(self._avail_w(), n)
+        cols, self.TW, self.TH = self._layout(self._avail_w(), self._avail_h(), n)
         self.flow.set_max_children_per_line(cols)
         for w in wins:
             child = Gtk.FlowBoxChild()
@@ -572,8 +577,17 @@ class Dashboard:
             self._focus(child.win, Gtk.get_current_event_time())
 
     def _focus(self, win, ts):
+        """Bring a window to the front and give it focus. Switch to its workspace and
+        unminimize first, so it actually appears even if it's on another desktop or
+        minimized -- then activate (raise + focus) with a real event timestamp."""
         try:
-            win.activate(ts or Gtk.get_current_event_time())
+            ts = ts or Gtk.get_current_event_time()
+            ws = win.get_workspace()
+            if ws is not None and self.screen.get_active_workspace() != ws:
+                ws.activate(ts)
+            if win.is_minimized():
+                win.unminimize(ts)
+            win.activate(ts)
         except Exception:
             pass
 
