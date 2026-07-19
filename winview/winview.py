@@ -18,6 +18,7 @@ import argparse
 import math
 import queue
 import threading
+from contextlib import contextmanager
 import gi
 
 gi.require_version('Gtk', '3.0')
@@ -88,13 +89,17 @@ def best_grid(n, avail_w, avail_h, aspect, gap, chrome_h, pad):
 
 def usable_windows(screen):
     out = []
-    for w in screen.get_windows():
-        if w.is_skip_tasklist():
-            continue
-        t = w.get_window_type()
-        if t in (Wnck.WindowType.DESKTOP, Wnck.WindowType.DOCK, Wnck.WindowType.SPLASHSCREEN):
-            continue
-        out.append(w)
+    with x_errors_ignored():
+        for w in screen.get_windows():
+            try:
+                if w.is_skip_tasklist():
+                    continue
+                t = w.get_window_type()
+            except Exception:
+                continue    # window died while we were walking the list
+            if t in (Wnck.WindowType.DESKTOP, Wnck.WindowType.DOCK, Wnck.WindowType.SPLASHSCREEN):
+                continue
+            out.append(w)
     return out
 
 
@@ -210,13 +215,75 @@ class CaptureWorker:
             GLib.idle_add(self._apply, xid, tw, th, surf)
 
 
+@contextmanager
+def x_errors_ignored():
+    """Survive X errors from windows that vanish mid-operation.
+
+    Windows can be destroyed between the moment we list them and the moment we read
+    their icon/title/geometry -- and GDK's default X error handler responds to a
+    BadWindow by calling abort(), which kills the whole app. Anything that churns
+    windows quickly (a screenshot tool's overlay, an app closing) can trip it, which
+    is why it shows up as a random death rather than a reproducible one. Trapping is
+    the GDK-sanctioned way to make those errors non-fatal."""
+    Gdk.error_trap_push()
+    try:
+        yield
+    finally:
+        Gdk.error_trap_pop_ignored()
+
+
 def scaled_icon(win, size):
-    icon = win.get_icon()
-    if icon is None:
+    with x_errors_ignored():
+        try:
+            icon = win.get_icon()
+        except Exception:
+            return None
+        if icon is None:
+            return None
+        if icon.get_width() != size:
+            icon = icon.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+        return icon
+
+
+def live_window(xid):
+    """Resolve an xid to a Wnck.Window, or None if it's gone.
+
+    NEVER store the result. Wnck.Window objects are owned by libwnck: keeping a
+    Python reference past the window's destruction means dropping it later runs
+    libwnck's finalize over already-freed state, segfaulting inside
+    g_hash_table_remove. That is precisely what killed WinView whenever something
+    churned windows quickly (a screenshot tool's overlay, say) -- the crash came
+    from RELEASING the reference, not from reading it. Hold xids; look the window
+    up at the moment of use."""
+    try:
+        return Wnck.Window.get(xid)
+    except Exception:
         return None
-    if icon.get_width() != size:
-        icon = icon.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
-    return icon
+
+
+def win_title(win):
+    with x_errors_ignored():
+        try:
+            return win.get_name() or '(untitled)'
+        except Exception:
+            return '(untitled)'
+
+
+def win_app(win):
+    with x_errors_ignored():
+        try:
+            app = win.get_application()
+            return app.get_name() if app else ''
+        except Exception:
+            return ''
+
+
+def win_minimized(win):
+    with x_errors_ignored():
+        try:
+            return win.is_minimized()
+        except Exception:
+            return False
 
 
 def clean_pixbuf(pb):
@@ -280,7 +347,7 @@ def surface_area(surface, w, h, css_class=None):
 
 def thumb_holder(win, tw, th):
     """A fixed-size thumbnail of the window, or its icon as a fallback."""
-    surf = None if win.is_minimized() else capture_surface(win.get_xid(), tw - 4, th - 4)
+    surf = None if win_minimized(win) else capture_surface(win.get_xid(), tw - 4, th - 4)
     if surf is not None:
         return surface_area(surf, tw, th, 'thumb')
     return pixbuf_area(scaled_icon(win, 48), tw, th, 'thumb')
@@ -300,7 +367,7 @@ def make_card(win, on_click, tw, th, title_chars=26):
     mini = scaled_icon(win, 16)
     if mini is not None:
         row.pack_start(pixbuf_area(mini, 16, 16), False, False, 0)
-    lbl = Gtk.Label(label=win.get_name() or '(untitled)')
+    lbl = Gtk.Label(label=win_title(win))
     lbl.get_style_context().add_class('title')
     lbl.set_ellipsize(Pango.EllipsizeMode.END)
     lbl.set_max_width_chars(title_chars)
@@ -648,7 +715,8 @@ class Dashboard:
         da.connect('draw', on_draw)
         return da
 
-    def _build_card(self, win):
+    def _build_card(self, xid):
+        win = live_window(xid)
         card = Gtk.EventBox()
         card.get_style_context().add_class('card')
         card.set_above_child(False)
@@ -665,7 +733,7 @@ class Dashboard:
         mini = scaled_icon(win, 16)
         if mini is not None:
             row.pack_start(pixbuf_area(mini, 16, 16), False, False, 0)
-        lbl = Gtk.Label(label=win.get_name() or '(untitled)')
+        lbl = Gtk.Label(label=win_title(win))
         lbl.get_style_context().add_class('title')
         lbl.set_ellipsize(Pango.EllipsizeMode.END)
         lbl.set_max_width_chars(26)
@@ -674,11 +742,10 @@ class Dashboard:
         box.pack_start(row, False, False, 0)
 
         card.add(box)
-        card.connect('button-press-event', lambda _w, e: self._click(win, e))
+        card.connect('button-press-event', lambda _w, e: self._click(xid, e))
         child = Gtk.FlowBoxChild()
-        child.win = win
-        app = win.get_application().get_name() if win.get_application() else ''
-        child.search = ((win.get_name() or '') + ' ' + app).lower()
+        child.xid = xid
+        child.search = (win_title(win) + ' ' + win_app(win)).lower()
         child.add(card)
         return child, thumb
 
@@ -693,7 +760,7 @@ class Dashboard:
         resized = (tw != self.TW or th != self.TH)
         self.TW, self.TH = tw, th
         self.flow.set_max_children_per_line(cols)
-        want = {w.get_xid(): w for w in wins}
+        want = {w.get_xid() for w in wins}
         for xid in list(self.cards):            # drop closed windows
             if xid not in want:
                 self.flow.remove(self.cards[xid]['child'])
@@ -702,8 +769,8 @@ class Dashboard:
         for w in wins:                          # add new windows
             xid = w.get_xid()
             if xid not in self.cards:
-                child, thumb = self._build_card(w)
-                self.cards[xid] = {'child': child, 'thumb': thumb, 'win': w}
+                child, thumb = self._build_card(xid)
+                self.cards[xid] = {'child': child, 'thumb': thumb}
                 self.flow.add(child)
                 added.append(xid)
         if resized:                             # keep the fit; recapture at the new size
@@ -722,8 +789,11 @@ class Dashboard:
         c = self.cards.get(xid)
         if not c:
             return
-        if c['win'].is_minimized():
-            pb = scaled_icon(c['win'], 48)
+        win = live_window(xid)
+        if win is None:
+            return
+        if win_minimized(win):
+            pb = scaled_icon(win, 48)
             c['thumb'].surface = None
             c['thumb'].pixbuf = clean_pixbuf(pb) if pb else None
             c['thumb'].queue_draw()
@@ -740,28 +810,33 @@ class Dashboard:
             c['thumb'].queue_draw()
         return False
 
-    def _click(self, win, event):
-        self._focus(win, event.time)
+    def _click(self, xid, event):
+        self._focus(xid, event.time)
         return False  # let FlowBox still select the child
 
     def _on_activated(self, _flow, child):
-        if getattr(child, 'win', None):
-            self._focus(child.win, Gtk.get_current_event_time())
+        xid = getattr(child, 'xid', None)
+        if xid:
+            self._focus(xid, Gtk.get_current_event_time())
 
-    def _focus(self, win, ts):
+    def _focus(self, xid, ts):
         """Bring a window to the front and give it focus. Switch to its workspace and
         unminimize first, so it actually appears even if it's on another desktop or
         minimized -- then activate (raise + focus) with a real event timestamp."""
-        try:
-            ts = ts or Gtk.get_current_event_time()
-            ws = win.get_workspace()
-            if ws is not None and self.screen.get_active_workspace() != ws:
-                ws.activate(ts)
-            if win.is_minimized():
-                win.unminimize(ts)
-            win.activate(ts)
-        except Exception:
-            pass
+        win = live_window(xid)
+        if win is None:
+            return
+        with x_errors_ignored():
+            try:
+                ts = ts or Gtk.get_current_event_time()
+                ws = win.get_workspace()
+                if ws is not None and self.screen.get_active_workspace() != ws:
+                    ws.activate(ts)
+                if win.is_minimized():
+                    win.unminimize(ts)
+                win.activate(ts)
+            except Exception:
+                pass
 
     def _on_search(self, entry):
         self.query = entry.get_text().strip().lower()
@@ -775,9 +850,12 @@ class Dashboard:
         alt = event.state & Gdk.ModifierType.MOD1_MASK
         if ctrl and event.keyval in (Gdk.KEY_w, Gdk.KEY_W):
             sel = self.flow.get_selected_children()
-            if sel and getattr(sel[0], 'win', None):
-                try: sel[0].win.close(Gtk.get_current_event_time())
-                except Exception: pass
+            xid = getattr(sel[0], 'xid', None) if sel else None
+            w = live_window(xid) if xid else None
+            if w is not None:
+                with x_errors_ignored():
+                    try: w.close(Gtk.get_current_event_time())
+                    except Exception: pass
             return True
         if event.keyval == Gdk.KEY_Escape and self.search.get_text():
             self.search.set_text('')
