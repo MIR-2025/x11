@@ -16,6 +16,8 @@ Needs: python3-gi, GTK 3, libwnck (gir1.2-wnck-3.0). All standard on XFCE.
 
 import argparse
 import math
+import queue
+import threading
 import gi
 
 gi.require_version('Gtk', '3.0')
@@ -109,15 +111,19 @@ def _xdisplay():
     return _XDISPLAY or None
 
 
-def capture_surface(xid, max_w, max_h):
-    """Grab a window's contents as a scaled cairo surface, or None.
+def _capture_with(d, xid, max_w, max_h):
+    """Grab a window's contents as a scaled cairo surface, or None, using the given
+    Xlib display `d`.
 
     Uses XGetImage (python-xlib), NOT gdk_pixbuf_get_from_window: the latter can abort
     the whole process in cairo (`cairo_surface_mark_dirty` on a surface that carries
     mime data) when it captures a window that's mid-render -- a race that's impossible
     to guard against from Python. XGetImage bypasses cairo/gdk, and still sees
-    obscured windows because the compositor keeps their pixmaps."""
-    d = _xdisplay()
+    obscured windows because the compositor keeps their pixmaps.
+
+    NOTE: XGetImage of a big (4K) window transfers ~32MB and takes ~450ms, so the
+    Dashboard runs this on a background thread (each thread with its own display) --
+    never call it on the GTK main thread for many windows at once."""
     if d is None:
         return None
     try:
@@ -155,6 +161,53 @@ def capture_surface(xid, max_w, max_h):
         return small
     except Exception:
         return None
+
+
+def capture_surface(xid, max_w, max_h):
+    """Synchronous capture on the shared display (used by the Overview/Panel modes,
+    which build rarely). The Dashboard uses CaptureWorker instead."""
+    return _capture_with(_xdisplay(), xid, max_w, max_h)
+
+
+class CaptureWorker:
+    """Captures window thumbnails on a background thread with its own X connection, so
+    the ~450ms XGetImage of a big 4K window never freezes the UI. Requests coalesce per
+    window (latest size wins); results are handed back on the GTK main thread via
+    GLib.idle_add."""
+
+    def __init__(self, apply_cb):
+        self._apply = apply_cb          # apply_cb(xid, tw, th, surface) -- runs on main thread
+        self._cv = threading.Condition()
+        self._pending = {}              # xid -> (tw, th), newest request wins
+        self._order = []                # FIFO of xids awaiting capture
+        self._disp = None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def request(self, xid, tw, th):
+        with self._cv:
+            if xid not in self._pending:
+                self._order.append(xid)
+            self._pending[xid] = (tw, th)
+            self._cv.notify()
+
+    def _run(self):
+        if not _HAVE_XLIB:
+            return
+        try:
+            self._disp = _xlib_display.Display()
+        except Exception:
+            return
+        while True:
+            with self._cv:
+                while not self._order:
+                    self._cv.wait()
+                xid = self._order.pop(0)
+                tw, th = self._pending.pop(xid)
+            try:
+                surf = _capture_with(self._disp, xid, tw - 4, th - 4)
+            except Exception:
+                surf = None
+            GLib.idle_add(self._apply, xid, tw, th, surf)
 
 
 def scaled_icon(win, size):
@@ -424,7 +477,7 @@ class Dashboard:
     or just type to filter). Meant to stay open and start on login. This is the
     default mode."""
 
-    REFRESH_MS = 5000
+    REFRESH_MS = 1500        # while the dashboard is focused, freshen a couple thumbs/tick
     TARGET_TW = 340          # desired thumbnail width in the scroll (overflow) fallback
     MIN_TW = 230             # below this, stop shrinking and start scrolling instead
     MAX_COLS = 8
@@ -483,14 +536,21 @@ class Dashboard:
         box.pack_start(self.sw, True, True, 0)
         self.win.add(box)
 
-        self._pending = False
-        for sig in ('window-opened', 'window-closed', 'active-window-changed'):
-            self.screen.connect(sig, self._schedule)
+        self.cards = {}       # xid -> {'child', 'thumb', 'win'}
+        self._rr = 0          # round-robin cursor for background thumbnail refresh
+        self._sync_id = 0
+        self._ownxid = None
+        self._worker = CaptureWorker(self._apply_capture)
+
+        # Structure changes rebuild cards; focus/activity only trigger cheap captures.
+        self.screen.connect('window-opened', self._schedule_sync)
+        self.screen.connect('window-closed', self._schedule_sync)
+        self.screen.connect('active-window-changed', self._on_active_changed)
+        self.win.connect('focus-in-event', self._on_win_focus)  # refresh all when opened
         GLib.timeout_add(self.REFRESH_MS, self._tick)
 
-        self.rebuild()
+        self._sync()
         self.win.show_all()
-        self.flow.get_style_context()  # ensure realized
         GLib.idle_add(lambda: (self.flow.grab_focus(), False)[1])
 
     def _default_size(self):
@@ -547,26 +607,138 @@ class Dashboard:
 
     def _resize_done(self):
         self._resize_id = 0
-        self.rebuild()
+        self._sync()
         return False
 
-    def rebuild(self):
-        for c in self.flow.get_children():
-            self.flow.remove(c)
+    def _own(self):
+        """Our own window's xid -- we don't want to keep re-capturing the dashboard
+        showing itself."""
+        if self._ownxid is None:
+            try:
+                self._ownxid = self.win.get_window().get_xid()
+            except Exception:
+                self._ownxid = 0
+        return self._ownxid
+
+    def _make_thumb(self):
+        """A DrawingArea whose image can be swapped in place (thumb.surface / .pixbuf)
+        and redrawn, so refreshing a thumbnail never recreates widgets."""
+        da = Gtk.DrawingArea()
+        da.get_style_context().add_class('thumb')
+        da.surface = None
+        da.pixbuf = None
+
+        def on_draw(_w, cr):
+            a = da.get_allocation()
+            if da.surface is not None:
+                sw, sh = da.surface.get_width(), da.surface.get_height()
+                if sw and sh:
+                    s = min(a.width / sw, a.height / sh)  # scale-to-fit (crisp when 1:1)
+                    cr.translate((a.width - sw * s) / 2, (a.height - sh * s) / 2)
+                    cr.scale(s, s)
+                    cr.set_source_surface(da.surface, 0, 0)
+                    cr.get_source().set_filter(cairo.FILTER_GOOD)
+                    cr.paint()
+            elif da.pixbuf is not None:
+                iw, ih = da.pixbuf.get_width(), da.pixbuf.get_height()
+                Gdk.cairo_set_source_pixbuf(cr, da.pixbuf, (a.width - iw) / 2, (a.height - ih) / 2)
+                cr.paint()
+            return False
+
+        da.connect('draw', on_draw)
+        return da
+
+    def _build_card(self, win):
+        card = Gtk.EventBox()
+        card.get_style_context().add_class('card')
+        card.set_above_child(False)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for m in ('top', 'bottom', 'start', 'end'):
+            getattr(box, 'set_margin_' + m)(8)
+        thumb = self._make_thumb()
+        thumb.set_size_request(self.TW, self.TH)
+        pb = scaled_icon(win, 48)                 # instant icon placeholder until capture lands
+        thumb.pixbuf = clean_pixbuf(pb) if pb else None
+        box.pack_start(thumb, False, False, 0)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        mini = scaled_icon(win, 16)
+        if mini is not None:
+            row.pack_start(pixbuf_area(mini, 16, 16), False, False, 0)
+        lbl = Gtk.Label(label=win.get_name() or '(untitled)')
+        lbl.get_style_context().add_class('title')
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        lbl.set_max_width_chars(26)
+        lbl.set_xalign(0.0)
+        row.pack_start(lbl, True, True, 0)
+        box.pack_start(row, False, False, 0)
+
+        card.add(box)
+        card.connect('button-press-event', lambda _w, e: self._click(win, e))
+        child = Gtk.FlowBoxChild()
+        child.win = win
+        app = win.get_application().get_name() if win.get_application() else ''
+        child.search = ((win.get_name() or '') + ' ' + app).lower()
+        child.add(card)
+        return child, thumb
+
+    def _sync(self):
+        """Reconcile cards with the open windows and re-fit their size. Does NOT
+        capture on the main thread -- new/resized thumbnails are requested from the
+        background worker and stream in."""
+        self._sync_id = 0
         wins = usable_windows(self.screen)
         n = len(wins)
-        cols, self.TW, self.TH = self._layout(self._avail_w(), self._avail_h(), n)
+        cols, tw, th = self._layout(self._avail_w(), self._avail_h(), n)
+        resized = (tw != self.TW or th != self.TH)
+        self.TW, self.TH = tw, th
         self.flow.set_max_children_per_line(cols)
-        for w in wins:
-            child = Gtk.FlowBoxChild()
-            child.win = w
-            app = w.get_application().get_name() if w.get_application() else ''
-            child.search = ((w.get_name() or '') + ' ' + app).lower()
-            child.add(make_card(w, self._click, self.TW, self.TH))
-            self.flow.add(child)
+        want = {w.get_xid(): w for w in wins}
+        for xid in list(self.cards):            # drop closed windows
+            if xid not in want:
+                self.flow.remove(self.cards[xid]['child'])
+                del self.cards[xid]
+        added = []
+        for w in wins:                          # add new windows
+            xid = w.get_xid()
+            if xid not in self.cards:
+                child, thumb = self._build_card(w)
+                self.cards[xid] = {'child': child, 'thumb': thumb, 'win': w}
+                self.flow.add(child)
+                added.append(xid)
+        if resized:                             # keep the fit; recapture at the new size
+            for c in self.cards.values():
+                c['thumb'].set_size_request(self.TW, self.TH)
         self.count.set_text(str(n) + (' window' if n == 1 else ' windows'))
         self.flow.show_all()
         self.flow.invalidate_filter()
+        for xid in (list(self.cards) if resized else added):
+            self._request_capture(xid)
+        return False
+
+    def _request_capture(self, xid):
+        """Ask for a fresh thumbnail. Minimized windows fall back to their icon (cheap,
+        no capture); everything else goes to the background worker."""
+        c = self.cards.get(xid)
+        if not c:
+            return
+        if c['win'].is_minimized():
+            pb = scaled_icon(c['win'], 48)
+            c['thumb'].surface = None
+            c['thumb'].pixbuf = clean_pixbuf(pb) if pb else None
+            c['thumb'].queue_draw()
+        else:
+            self._worker.request(xid, self.TW, self.TH)
+
+    def _apply_capture(self, xid, tw, th, surface):
+        """Runs on the main thread (via GLib.idle_add from the worker). Drops results
+        whose size no longer matches (e.g. captured just before a resize)."""
+        c = self.cards.get(xid)
+        if c and surface is not None and tw == self.TW and th == self.TH:
+            c['thumb'].surface = surface
+            c['thumb'].pixbuf = None
+            c['thumb'].queue_draw()
+        return False
 
     def _click(self, win, event):
         self._focus(win, event.time)
@@ -622,19 +794,37 @@ class Dashboard:
                     return True
         return False
 
-    def _schedule(self, *_a):
-        if self._pending:
-            return
-        self._pending = True
-        GLib.timeout_add(250, self._do_scheduled)
+    def _schedule_sync(self, *_a):
+        # Coalesce bursts of window-open/close into one structural reconcile.
+        if not self._sync_id:
+            self._sync_id = GLib.timeout_add(200, self._sync)
 
-    def _do_scheduled(self):
-        self._pending = False
-        self.rebuild()
+    def _on_active_changed(self, *_a):
+        # The window you just switched to is the one most likely to have changed --
+        # refresh just that one (in the background), not the whole grid.
+        aw = self.screen.get_active_window()
+        if aw is not None:
+            ax = aw.get_xid()
+            if ax in self.cards and ax != self._own():
+                self._request_capture(ax)
+
+    def _on_win_focus(self, *_a):
+        # When you bring the dashboard up, refresh every thumbnail so it's current.
+        own = self._own()
+        for xid in self.cards:
+            if xid != own:
+                self._request_capture(xid)
         return False
 
     def _tick(self):
-        self.rebuild()
+        # Only spend capture effort while you're actually looking at the dashboard;
+        # when it's not focused this does nothing, so an idle dashboard costs nothing.
+        if self.cards and self.win.is_active():
+            own = self._own()
+            xids = [x for x in self.cards if x != own]
+            for _ in range(min(2, len(xids))):        # freshen a couple per tick
+                self._rr = (self._rr + 1) % len(xids)
+                self._request_capture(xids[self._rr])
         return True
 
 
